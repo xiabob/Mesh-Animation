@@ -17,6 +17,8 @@ namespace CodeWriter.MeshAnimation
 
         private MaterialPropertyBlock _propertyBlock;
 
+        public MaterialPropertyBlock GetPropertyBlock() => _propertyBlock;
+
         private void Awake()
         {
             _propertyBlock = new MaterialPropertyBlock();

@@ -1,6 +1,6 @@
-#if UNITY_EDITOR
 namespace CodeWriter.MeshAnimation
 {
+#if UNITY_EDITOR
     using System;
     using System.Linq;
     using System.Collections.Generic;
@@ -10,7 +10,7 @@ namespace CodeWriter.MeshAnimation
     using UnityEngine;
     using Object = UnityEngine.Object;
 
-    public static class MeshAnimationBaker
+    public static class ManualMeshAnimationBaker
     {
         private static readonly int AnimTextureProp = Shader.PropertyToID("_AnimTex");
         private static readonly int AnimationMulProp = Shader.PropertyToID("_AnimMul");
@@ -36,42 +36,6 @@ namespace CodeWriter.MeshAnimation
             asset.animationData = new List<MeshAnimationAsset.AnimationData>();
 
             SaveAsset(asset);
-        }
-
-        public static void Bake([NotNull] MeshAnimationAsset asset)
-        {
-            if (asset == null)
-            {
-                throw new ArgumentNullException(nameof(asset));
-            }
-
-            var error = asset.GetValidationMessage();
-            if (error != null)
-            {
-                throw new InvalidOperationException(error);
-            }
-
-            try
-            {
-                AssetDatabase.DisallowAutoRefresh();
-                EditorUtility.DisplayProgressBar("Mesh Animator", "Baking", 0f);
-
-                DestroyObject(ref asset.bakedTexture);
-                CreateTexture(asset, out var aborted);
-                if (!aborted)
-                {
-                    CreateMaterial(asset);
-                    CreateExtraMaterials(asset);
-                    BakeAnimations(asset);
-                }
-
-                SaveAsset(asset);
-            }
-            finally
-            {
-                EditorUtility.ClearProgressBar();
-                AssetDatabase.AllowAutoRefresh();
-            }
         }
 
         private static void DestroyObject<T>(ref T field) where T : Object
@@ -195,7 +159,7 @@ namespace CodeWriter.MeshAnimation
                 var textHeight = asset.npotBakedTexture ? framesCount : Mathf.NextPowerOfTwo(framesCount);
                 var linear = asset.linearColorSpace;
 
-                var texture = new Texture2D(texWidth, textHeight, TextureFormat.RGBAHalf, false, linear)
+                var texture = new Texture2D(texWidth, textHeight, TextureFormat.RGB24, false, linear)
                 {
                     name = asset.name + " Texture",
                     hideFlags = HideFlags.NotEditable,
@@ -207,10 +171,70 @@ namespace CodeWriter.MeshAnimation
             }
         }
 
-        private static void BakeAnimations(MeshAnimationAsset asset)
+        public static void PrepareBake(MeshAnimationAsset asset, BakeProgressInfo progressInfo)
         {
-            var bakeObject = Object.Instantiate(asset.skin.gameObject);
-            bakeObject.hideFlags = HideFlags.HideAndDontSave;
+            if (asset == null)
+            {
+                throw new ArgumentNullException(nameof(asset));
+            }
+
+            var error = asset.GetValidationMessage();
+            if (error != null)
+            {
+                throw new InvalidOperationException(error);
+            }
+
+            try
+            {
+                AssetDatabase.DisallowAutoRefresh();
+                EditorUtility.DisplayProgressBar("Mesh Animator", "Baking", 0f);
+
+                DestroyObject(ref asset.bakedTexture);
+                CreateTexture(asset, out var aborted);
+                if (!aborted)
+                {
+                    CreateMaterial(asset);
+                    CreateExtraMaterials(asset);
+                }
+
+                var materials = new HashSet<Material> { asset.bakedMaterial };
+                foreach (var data in asset.extraMaterialData)
+                {
+                    materials.Add(data.material);
+                }
+
+                foreach (var material in materials)
+                {
+                    material.SetTexture(AnimTextureProp, asset.bakedTexture);
+                    material.SetVector(AnimationMulProp, progressInfo.boundMax - progressInfo.boundMin);
+                    material.SetVector(AnimationAddProp, progressInfo.boundMin);
+                    material.SetFloat(AnimationNormalStartProp, progressInfo.totalFrameCount);
+                }
+
+
+                SaveAsset(asset);
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+                AssetDatabase.AllowAutoRefresh();
+            }
+        }
+
+        public class BakeProgressInfo
+        {
+            public Vector3 boundMin;
+            public Vector3 boundMax;
+            public int globalFrame;
+            public int totalFrameCount;
+            public int frame;
+            public int framesCount;
+            public bool looping;
+        }
+
+
+        public static void BakeSingleFrameAnimation(MeshAnimationAsset asset, BakeProgressInfo progressInfo, GameObject bakeObject)
+        {
             var bakeMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
             var skin = bakeObject.GetComponentInChildren<SkinnedMeshRenderer>();
 
@@ -219,112 +243,22 @@ namespace CodeWriter.MeshAnimation
             bakeTransform.localRotation = Quaternion.identity;
             bakeTransform.localScale = Vector3.one;
 
-            var boundMin = Vector3.zero;
-            var boundMax = Vector3.zero;
-            var totalFrameCount = 0;
+            skin.BakeMesh(bakeMesh);
 
-            var animator = bakeObject.GetComponent<Animator>();
-            if (animator != null && animator.runtimeAnimatorController == null)
+            CaptureMeshToTexture(asset.bakedTexture, bakeMesh, progressInfo.boundMin, progressInfo.boundMax, progressInfo.globalFrame, progressInfo.totalFrameCount);
+
+            if (progressInfo.looping && progressInfo.frame == 0)
             {
-                Debug.LogError("animator != null && animator.runtimeAnimatorController == null");
-                return;
+                CaptureMeshToTexture(asset.bakedTexture, bakeMesh, progressInfo.boundMin, progressInfo.boundMax,
+                    progressInfo.globalFrame + progressInfo.framesCount, progressInfo.totalFrameCount);
+            }
+            else if (!progressInfo.looping && progressInfo.frame == progressInfo.framesCount - 1)
+            {
+                CaptureMeshToTexture(asset.bakedTexture, bakeMesh, progressInfo.boundMin, progressInfo.boundMax, progressInfo.globalFrame + 1, progressInfo.totalFrameCount);
             }
 
-            asset.animationData.Clear();
-
-            AnimationMode.StartAnimationMode();
-            AnimationMode.BeginSampling();
-
-            try
-            {
-                foreach (var clip in asset.animationClips)
-                {
-                    var framesCount = clip.GetFramesCount();
-                    for (int frame = 0; frame < framesCount; frame++)
-                    {
-                        EditorUtility.DisplayProgressBar("Mesh Animator", clip.name, 1f * frame / framesCount);
-
-                        AnimationMode.SampleAnimationClip(bakeObject, clip, frame / clip.frameRate);
-                        skin.BakeMesh(bakeMesh);
-
-                        var vertices = bakeMesh.vertices;
-                        foreach (var vertex in vertices)
-                        {
-                            boundMin = Vector3.Min(boundMin, vertex);
-                            boundMax = Vector3.Max(boundMax, vertex);
-                        }
-                    }
-                    totalFrameCount += framesCount;
-                }
-
-                int globalFrame = 0;
-                foreach (var clip in asset.animationClips)
-                {
-                    var framesCount = clip.GetFramesCount();
-                    var looping = clip.isLooping;
-
-                    asset.animationData.Add(new MeshAnimationAsset.AnimationData
-                    {
-                        name = clip.name,
-                        startFrame = globalFrame,
-                        lengthFrames = framesCount,
-                        lengthSeconds = clip.length,
-                        looping = looping,
-                    });
-
-                    for (int frame = 0; frame < framesCount; frame++)
-                    {
-                        EditorUtility.DisplayProgressBar("Mesh Animator", clip.name, 1f * frame / framesCount);
-
-                        AnimationMode.SampleAnimationClip(bakeObject, clip, frame / clip.frameRate);
-                        skin.BakeMesh(bakeMesh);
-
-                        CaptureMeshToTexture(asset.bakedTexture, bakeMesh, boundMin, boundMax, globalFrame, totalFrameCount);
-
-                        if (looping && frame == 0)
-                        {
-                            CaptureMeshToTexture(asset.bakedTexture, bakeMesh, boundMin, boundMax,
-                                globalFrame + framesCount, totalFrameCount);
-                        }
-                        else if (!looping && frame == framesCount - 1)
-                        {
-                            CaptureMeshToTexture(asset.bakedTexture, bakeMesh, boundMin, boundMax, globalFrame + 1, totalFrameCount);
-                        }
-
-                        ++globalFrame;
-                    }
-
-                    ++globalFrame;
-                }
-
-                while (globalFrame < asset.bakedTexture.height)
-                {
-                    CaptureMeshToTexture(asset.bakedTexture, bakeMesh, boundMin, boundMax, globalFrame, totalFrameCount);
-                    ++globalFrame;
-                }
-            }
-            finally
-            {
-                AnimationMode.EndSampling();
-                AnimationMode.StopAnimationMode();
-            }
-
-            Object.DestroyImmediate(bakeObject);
-            Object.DestroyImmediate(bakeMesh);
-
-            var materials = new HashSet<Material> { asset.bakedMaterial };
-            foreach (var data in asset.extraMaterialData)
-            {
-                materials.Add(data.material);
-            }
-
-            foreach (var material in materials)
-            {
-                material.SetTexture(AnimTextureProp, asset.bakedTexture);
-                material.SetVector(AnimationMulProp, boundMax - boundMin);
-                material.SetVector(AnimationAddProp, boundMin);
-                material.SetFloat(AnimationNormalStartProp, totalFrameCount);
-            }
+            asset.bakedTexture.Apply();
+            SaveAsset(asset);
         }
 
         private static void CaptureMeshToTexture(Texture2D texture, Mesh mesh, Vector3 min, Vector3 max, int line, int totalFrameCount)
@@ -369,6 +303,7 @@ namespace CodeWriter.MeshAnimation
         {
             return Mathf.CeilToInt(clip.length * clip.frameRate);
         }
+
     }
-}
 #endif
+}
